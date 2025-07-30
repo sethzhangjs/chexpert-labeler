@@ -5,3 +5,7 @@ cache/
 __pycache__/
 */__pycache__/
 */__pycache__/*
+demo/**/*.csv
+demo/**/*.txt
+demo/logs
+demo/data/archive

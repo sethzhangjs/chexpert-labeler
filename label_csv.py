@@ -296,28 +296,37 @@ def preprocess_text(text, max_length=350):
     return f'"{text}"'
 
 
-def prepare_csv_input(input_csv_path, text_column='text'):
+def prepare_csv_input(input_csv_path, text_column='text', max_num=None):
     """
     Read CSV file and prepare it for CheXpert processing.
     
     Args:
         input_csv_path: Path to input CSV file
         text_column: Name of the column containing text data
+        max_num: Maximum number of records to process (None for all records)
         
     Returns:
-        DataFrame: Original dataframe for later merging
+        DataFrame: Original dataframe for later merging (limited to max_num if specified)
     """
     print(f"[INFO] Reading CSV file: {input_csv_path}")
     
     # Read the input CSV
     df = pd.read_csv(input_csv_path)
-    print(f"[INFO] CSV loaded successfully. Shape: {df.shape}")
+    print(f"[INFO] CSV loaded successfully. Original shape: {df.shape}")
     print(f"[INFO] Available columns: {list(df.columns)}")
     
     if text_column not in df.columns:
         raise ValueError(f"Column '{text_column}' not found in CSV. Available columns: {list(df.columns)}")
     
     print(f"[INFO] Using text column: '{text_column}'")
+    
+    # Apply max_num limit if specified
+    if max_num is not None and max_num > 0:
+        original_len = len(df)
+        df = df.head(max_num)
+        print(f"[INFO] Limited processing to first {len(df)} records (out of {original_len} total records)")
+    else:
+        print(f"[INFO] Processing all {len(df)} records")
     
     return df
 
@@ -434,6 +443,14 @@ def write_enhanced(reports, labels, output_path, original_df=None, verbose=False
         print(f"[OUTPUT] Final dataframe shape: {labeled_reports.shape}")
 
     print(f"[OUTPUT] Saving to CSV: {output_path}")
+
+    # Ensure output directory exists
+    output_dir = os.path.dirname(output_path)
+    if output_dir and not os.path.exists(output_dir):
+        os.makedirs(output_dir)
+        print(f"[OUTPUT] Created output directory: {output_dir}")
+        
+    # Write to CSV
     labeled_reports.to_csv(output_path, index=False)
     
     if verbose:
@@ -461,7 +478,13 @@ def label(args):
             
         # Get processing parameters
         batch_size = args.batch_size
+        max_num = getattr(args, 'max_num', None)
         print(f"[INFO] Using batch size: {batch_size}")
+        
+        if max_num is not None:
+            print(f"[INFO] Maximum records to process: {max_num}")
+        else:
+            print(f"[INFO] Processing all records in the file")
         
         # Check processing mode
         use_segmentation = getattr(args, 'enable_segmentation', False)
@@ -473,9 +496,9 @@ def label(args):
             max_text_length = getattr(args, 'max_text_length', 350)
             print(f"[INFO] Using traditional truncation - max_length: {max_text_length}")
         
-        # Read CSV file
+        # Read CSV file with max_num limit
         text_column = getattr(args, 'text_column', 'text')
-        original_df = prepare_csv_input(reports_path_str, text_column)
+        original_df = prepare_csv_input(reports_path_str, text_column, max_num)
         
         # Initialize CheXpert components (shared across batches)
         extractor = Extractor(args.mention_phrases_dir,
@@ -585,10 +608,12 @@ if __name__ == "__main__":
                                    help='Name of the column containing text data in CSV input')
     parser.parser.add_argument('--label_prefix', default='CheXpert_',
                                 help='Prefix for CheXpert result columns to avoid naming conflicts')
-    parser.parser.add_argument('--batch_size', type=int, default=1000,
+    parser.parser.add_argument('--batch_size', type=int, default=100,
                                 help='Number of rows to process in each batch (for CSV input)')
-    parser.parser.add_argument('--max_text_length', type=int, default=350,
+    parser.parser.add_argument('--max_text_length', type=int, default=380,
                                 help='Maximum text length in tokens (BLLIP parser limit is 399)')
+    parser.parser.add_argument('--max_num', type=int, default=None,
+                                help='Maximum number of records to process from CSV file (None for all records)')
     
     # segmentation arguments
     parser.parser.add_argument('--enable_segmentation', action='store_true',

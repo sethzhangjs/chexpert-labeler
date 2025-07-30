@@ -1,6 +1,8 @@
 #!/usr/bin/env python3
 """
-Parallel version of CheXpert labeler with multiprocessing support.
+Batch-level parallel processing version for CheXpert labeler.
+This version processes multiple batches in parallel instead of individual records,
+which is more stable and avoids parser initialization issues.
 """
 import pandas as pd
 import csv
@@ -9,10 +11,11 @@ import os
 import numpy as np
 from typing import List, Tuple
 import multiprocessing as mp
-from multiprocessing import Pool, Manager
-import pickle
+from multiprocessing import Pool
 import time
-from functools import partial
+import subprocess
+import shutil
+from pathlib import Path
 
 from args import ArgParser
 from loader import Loader
@@ -128,127 +131,6 @@ def integrate_segment_results(segment_labels: List[np.ndarray]) -> np.ndarray:
     return np.array(integrated_result, dtype=object).reshape(1, -1)
 
 
-def create_chexpert_components(args):
-    """
-    Create CheXpert components (extractor, classifier, aggregator).
-    This function is used to initialize components in each worker process.
-    """
-    extractor = Extractor(args.mention_phrases_dir,
-                          args.unmention_phrases_dir,
-                          verbose=False)  # Disable verbose in workers
-    classifier = Classifier(args.pre_negation_uncertainty_path,
-                            args.negation_path,
-                            args.post_negation_uncertainty_path,
-                            verbose=False)
-    aggregator = Aggregator(CATEGORIES, verbose=False)
-    
-    return extractor, classifier, aggregator
-
-
-def process_single_record_parallel(record_data, args_dict):
-    """
-    Process a single record in parallel worker process.
-    
-    Args:
-        record_data: Tuple of (index, text) for the record
-        args_dict: Dictionary containing arguments
-    
-    Returns:
-        Tuple of (index, labels, processed_report)
-    """
-    idx, text = record_data
-    
-    # Recreate args object from dictionary
-    class Args:
-        def __init__(self, d):
-            for k, v in d.items():
-                setattr(self, k, v)
-    
-    args = Args(args_dict)
-    
-    # Create CheXpert components for this worker
-    extractor, classifier, aggregator = create_chexpert_components(args)
-    
-    try:
-        if getattr(args, 'enable_segmentation', False):
-            # Use segmentation processing
-            record_labels, record_report = process_text_with_segmentation_worker(
-                text, args, extractor, classifier, aggregator
-            )
-        else:
-            # Use traditional truncation approach
-            max_length = getattr(args, 'max_text_length', 350)
-            processed_text = preprocess_text(text, max_length)
-            record_labels, record_report = process_single_segment_worker(
-                processed_text, args, extractor, classifier, aggregator
-            )
-        
-        return idx, record_labels, record_report
-        
-    except Exception as e:
-        print(f"Error processing record {idx}: {e}")
-        # Return empty results for failed records
-        empty_labels = np.array([np.nan] * len(CATEGORIES), dtype=object)
-        return idx, empty_labels, '""'
-
-
-def process_single_segment_worker(segment_text: str, args, extractor, classifier, aggregator) -> Tuple[np.ndarray, str]:
-    """
-    Process a single text segment through the CheXpert pipeline (worker version).
-    """
-    temp_fd, temp_path = tempfile.mkstemp(suffix='.csv', text=True)
-    
-    try:
-        with os.fdopen(temp_fd, 'w', newline='', encoding='utf-8') as temp_file:
-            writer = csv.writer(temp_file)
-            writer.writerow([segment_text])
-        
-        segment_loader = Loader(temp_path, 
-                              args.sections_to_extract,
-                              args.extract_strict)
-        
-        segment_loader.load()
-        extractor.extract(segment_loader.collection)
-        classifier.classify(segment_loader.collection)
-        segment_labels = aggregator.aggregate(segment_loader.collection)
-        
-        return segment_labels[0], segment_loader.reports[0]
-        
-    finally:
-        try:
-            os.unlink(temp_path)
-        except:
-            pass
-
-
-def process_text_with_segmentation_worker(text: str, args, extractor, classifier, aggregator) -> Tuple[np.ndarray, str]:
-    """
-    Process text with segmentation support for long texts (worker version).
-    """
-    segment_length = getattr(args, 'segment_length', 300)
-    overlap = getattr(args, 'segment_overlap', 50)
-    
-    segments = preprocess_text_segmented(text, segment_length, overlap)
-    
-    if len(segments) == 1:
-        return process_single_segment_worker(segments[0], args, extractor, classifier, aggregator)
-    
-    # Long text: process segments separately
-    all_segment_labels = []
-    all_segment_reports = []
-    
-    for segment in segments:
-        segment_labels, segment_report = process_single_segment_worker(segment, args, extractor, classifier, aggregator)
-        all_segment_labels.append(segment_labels)
-        all_segment_reports.append(segment_report.strip('"'))
-    
-    # Integrate results from all segments
-    integrated_labels = integrate_segment_results(all_segment_labels)
-    combined_report = " [SEG] ".join(all_segment_reports)
-    
-    return integrated_labels[0], f'"{combined_report}"'
-
-
 def preprocess_text(text, max_length=350):
     """
     Original text preprocessing function (for backward compatibility).
@@ -267,199 +149,289 @@ def preprocess_text(text, max_length=350):
     return f'"{text}"'
 
 
-def process_batch_parallel(batch_df, text_column, batch_num, total_batches, args, num_workers=None):
+def process_batch_file(batch_file_path, args_dict, worker_id):
     """
-    Process a batch of records using multiprocessing.
+    Process a single batch file using the original CheXpert pipeline.
+    This function runs in a separate process.
     
     Args:
-        batch_df: DataFrame containing the batch of records to process
-        text_column: Name of the text column
-        batch_num: Current batch number
-        total_batches: Total number of batches
-        args: Command line arguments
-        num_workers: Number of worker processes (None for auto-detect)
+        batch_file_path: Path to the CSV file containing the batch
+        args_dict: Dictionary of arguments
+        worker_id: ID of the worker process
     
     Returns:
-        Tuple of (label array, list of processed reports)
+        Path to the output file with results
     """
-    print(f"[BATCH {batch_num}/{total_batches}] Processing {len(batch_df)} reports in parallel...")
+    print(f"[WORKER {worker_id}] Processing batch: {batch_file_path}")
     
+    # Recreate args object
+    class Args:
+        def __init__(self, d):
+            for k, v in d.items():
+                setattr(self, k, v)
+    
+    args = Args(args_dict)
+    
+    try:
+        # Create temporary output path
+        output_path = batch_file_path.replace('.csv', '_results.csv')
+        
+        # Import and use the original label function from your existing code
+        # We'll call the original CheXpert pipeline on this batch
+        loader = Loader(batch_file_path,
+                        args.sections_to_extract,
+                        args.extract_strict)
+
+        extractor = Extractor(args.mention_phrases_dir,
+                              args.unmention_phrases_dir,
+                              verbose=False)
+        classifier = Classifier(args.pre_negation_uncertainty_path,
+                                args.negation_path,
+                                args.post_negation_uncertainty_path,
+                                verbose=False)
+        aggregator = Aggregator(CATEGORIES, verbose=False)
+
+        # Process the batch
+        loader.load()
+        extractor.extract(loader.collection)
+        classifier.classify(loader.collection)
+        labels = aggregator.aggregate(loader.collection)
+
+        # Create output dataframe
+        labeled_reports = pd.DataFrame({REPORTS: loader.reports})
+        for index, category in enumerate(CATEGORIES):
+            labeled_reports[category] = labels[:, index]
+
+        # Save results
+        labeled_reports.to_csv(output_path, index=False)
+        
+        print(f"[WORKER {worker_id}] Completed batch: {batch_file_path}")
+        return output_path
+        
+    except Exception as e:
+        print(f"[WORKER {worker_id}] Error processing batch {batch_file_path}: {e}")
+        return None
+
+
+def split_dataframe_into_batches(df, text_column, batch_size, temp_dir, args):
+    """
+    Split dataframe into smaller CSV files for batch processing.
+    
+    Args:
+        df: Input dataframe
+        text_column: Name of text column
+        batch_size: Number of records per batch
+        temp_dir: Temporary directory for batch files
+        args: Arguments object
+    
+    Returns:
+        List of batch file paths
+    """
+    batch_files = []
+    total_rows = len(df)
+    
+    use_segmentation = getattr(args, 'enable_segmentation', False)
+    max_length = getattr(args, 'max_text_length', 350)
+    
+    for i in range(0, total_rows, batch_size):
+        end_idx = min(i + batch_size, total_rows)
+        batch_df = df.iloc[i:end_idx].copy()
+        
+        # Preprocess text in this batch
+        processed_texts = []
+        for _, row in batch_df.iterrows():
+            text = row[text_column]
+            
+            if use_segmentation:
+                # For segmentation, we'll create multiple rows for each text
+                segments = preprocess_text_segmented(
+                    text, 
+                    getattr(args, 'segment_length', 300),
+                    getattr(args, 'segment_overlap', 50)
+                )
+                # For batch processing, we'll just use the first segment or combine them
+                # This is a simplified approach - you might want to handle this differently
+                if len(segments) == 1:
+                    processed_texts.append(segments[0])
+                else:
+                    # Combine segments for batch processing
+                    combined_text = ' [SEG] '.join([seg.strip('"') for seg in segments])
+                    processed_texts.append(f'"{combined_text}"')
+            else:
+                processed_text = preprocess_text(text, max_length)
+                processed_texts.append(processed_text)
+        
+        # Create batch CSV file
+        batch_file = os.path.join(temp_dir, f'batch_{i//batch_size + 1}.csv')
+        
+        with open(batch_file, 'w', newline='', encoding='utf-8') as f:
+            writer = csv.writer(f)
+            for text in processed_texts:
+                writer.writerow([text])
+        
+        batch_files.append(batch_file)
+        print(f"[SPLIT] Created batch file: {batch_file} ({len(processed_texts)} records)")
+    
+    return batch_files
+
+
+def process_batches_parallel(batch_files, args, num_workers=None):
+    """
+    Process multiple batch files in parallel.
+    
+    Args:
+        batch_files: List of batch file paths
+        args: Arguments object
+        num_workers: Number of worker processes
+    
+    Returns:
+        List of result file paths
+    """
     if num_workers is None:
-        num_workers = min(mp.cpu_count(), len(batch_df))
+        num_workers = min(mp.cpu_count(), len(batch_files))
     
-    print(f"[BATCH {batch_num}/{total_batches}] Using {num_workers} worker processes")
+    print(f"[PARALLEL] Processing {len(batch_files)} batches using {num_workers} workers")
     
-    # Prepare data for parallel processing
-    record_data = [(idx, row[text_column]) for idx, row in batch_df.iterrows()]
-    
-    # Convert args to dictionary for pickling
+    # Convert args to dictionary
     args_dict = vars(args)
     
-    # Process records in parallel
+    # Prepare arguments for parallel processing
+    worker_args = [(batch_file, args_dict, i+1) for i, batch_file in enumerate(batch_files)]
+    
     start_time = time.time()
     
+    # Process batches in parallel
     with Pool(processes=num_workers) as pool:
-        worker_func = partial(process_single_record_parallel, args_dict=args_dict)
-        results = pool.map(worker_func, record_data)
+        result_files = pool.starmap(process_batch_file, worker_args)
     
     processing_time = time.time() - start_time
-    print(f"[BATCH {batch_num}/{total_batches}] Parallel processing completed in {processing_time:.2f} seconds")
+    print(f"[PARALLEL] Completed all batches in {processing_time:.2f} seconds")
     
-    # Sort results by original index and extract labels and reports
-    results.sort(key=lambda x: x[0])
+    # Filter out failed results
+    successful_results = [f for f in result_files if f is not None]
     
-    all_labels = np.array([result[1] for result in results])
-    all_reports = [result[2] for result in results]
+    if len(successful_results) != len(batch_files):
+        print(f"[WARNING] {len(batch_files) - len(successful_results)} batches failed")
     
-    print(f"[BATCH {batch_num}/{total_batches}] Generated {len(all_labels)} labels")
-    
-    return all_labels, all_reports
+    return successful_results
 
 
-def prepare_csv_input(input_csv_path, text_column='text'):
+def combine_batch_results(result_files, original_df, output_path, args):
     """
-    Read CSV file and prepare it for CheXpert processing.
+    Combine results from multiple batch files.
+    
+    Args:
+        result_files: List of result file paths
+        original_df: Original input dataframe
+        output_path: Final output path
+        args: Arguments object
     """
-    print(f"[INFO] Reading CSV file: {input_csv_path}")
+    print(f"[COMBINE] Combining results from {len(result_files)} batch files")
     
-    df = pd.read_csv(input_csv_path)
-    print(f"[INFO] CSV loaded successfully. Shape: {df.shape}")
-    print(f"[INFO] Available columns: {list(df.columns)}")
+    all_reports = []
+    all_labels = []
     
-    if text_column not in df.columns:
-        raise ValueError(f"Column '{text_column}' not found in CSV. Available columns: {list(df.columns)}")
+    for result_file in result_files:
+        try:
+            batch_df = pd.read_csv(result_file)
+            all_reports.extend(batch_df[REPORTS].tolist())
+            
+            # Extract label columns
+            label_data = batch_df[CATEGORIES].values
+            all_labels.append(label_data)
+            
+        except Exception as e:
+            print(f"[ERROR] Failed to read result file {result_file}: {e}")
     
-    print(f"[INFO] Using text column: '{text_column}'")
+    if not all_labels:
+        raise RuntimeError("No successful batch results to combine")
     
-    return df
-
-
-def write_enhanced(reports, labels, output_path, original_df=None, verbose=False, label_prefix="CheXpert_"):
-    """
-    Write labeled reports to specified path with original data preserved.
-    """
-    print(f"[OUTPUT] Creating output dataframe...")
+    # Combine all labels
+    combined_labels = np.vstack(all_labels)
     
-    labeled_reports = pd.DataFrame({REPORTS: reports})
-    print(f"[OUTPUT] Added {len(reports)} reports to output")
+    print(f"[COMBINE] Combined {len(all_reports)} reports and {combined_labels.shape[0]} label sets")
     
+    # Create final output
+    labeled_reports = pd.DataFrame({REPORTS: all_reports})
+    
+    # Add CheXpert results with prefix
+    label_prefix = getattr(args, 'label_prefix', 'CheXpert_')
     chexpert_columns = []
     for index, category in enumerate(CATEGORIES):
         chexpert_col_name = f"{label_prefix}{category}"
-        labeled_reports[chexpert_col_name] = labels[:, index]
+        labeled_reports[chexpert_col_name] = combined_labels[:, index]
         chexpert_columns.append(chexpert_col_name)
     
-    print(f"[OUTPUT] Added {len(chexpert_columns)} CheXpert result columns")
-
+    # Merge with original data
     if original_df is not None:
-        print(f"[OUTPUT] Merging with {len(original_df.columns)} original columns...")
         for col in original_df.columns:
             if col not in labeled_reports.columns and col != 'text':
                 labeled_reports[col] = original_df[col].values[:len(labeled_reports)]
         
+        # Reorder columns
         original_cols = [col for col in original_df.columns if col != 'text']
         new_column_order = original_cols + [REPORTS] + chexpert_columns
         labeled_reports = labeled_reports[[col for col in new_column_order if col in labeled_reports.columns]]
-        print(f"[OUTPUT] Final dataframe shape: {labeled_reports.shape}")
-
-    print(f"[OUTPUT] Saving to CSV: {output_path}")
-    labeled_reports.to_csv(output_path, index=False)
     
-    if verbose:
-        print(f"[OUTPUT] CheXpert results saved with prefix: '{label_prefix}'")
-        print(f"[OUTPUT] Total columns in output: {len(labeled_reports.columns)}")
-        
-    print(f"[OUTPUT] File saved successfully")
+    # Save final results
+    labeled_reports.to_csv(output_path, index=False)
+    print(f"[COMBINE] Final results saved to: {output_path}")
 
 
-def label_parallel(args):
+def label_batch_parallel(args):
     """
-    Main labeling function with parallel processing support.
+    Main function for batch-level parallel processing.
     """
     reports_path_str = str(args.reports_path)
     
-    if reports_path_str.endswith('.csv'):
-        verbose = getattr(args, 'verbose', False)
-        if verbose:
-            print(f"Processing CSV input: {reports_path_str}")
-            
-        # Get processing parameters
-        batch_size = args.batch_size
-        num_workers = getattr(args, 'num_workers', None)
-        if num_workers is None:
-            num_workers = mp.cpu_count()
+    if not reports_path_str.endswith('.csv'):
+        raise ValueError("Batch parallel processing only supports CSV input")
+    
+    print(f"[INFO] Processing CSV input with batch-level parallelization: {reports_path_str}")
+    
+    # Read input data
+    text_column = getattr(args, 'text_column', 'text')
+    original_df = pd.read_csv(reports_path_str)
+    
+    print(f"[INFO] Loaded {len(original_df)} records")
+    print(f"[INFO] Using text column: '{text_column}'")
+    
+    # Get parameters
+    batch_size = getattr(args, 'batch_size', 1000)
+    num_workers = getattr(args, 'num_workers', mp.cpu_count())
+    
+    print(f"[INFO] Batch size: {batch_size}")
+    print(f"[INFO] Number of workers: {num_workers}")
+    
+    # Create temporary directory for batch files
+    temp_dir = tempfile.mkdtemp(prefix='chexpert_batch_')
+    print(f"[INFO] Temporary directory: {temp_dir}")
+    
+    try:
+        # Split data into batches
+        print(f"[STEP 1/4] Splitting data into batches...")
+        batch_files = split_dataframe_into_batches(original_df, text_column, batch_size, temp_dir, args)
         
-        print(f"[INFO] Using batch size: {batch_size}")
-        print(f"[INFO] Using {num_workers} worker processes per batch")
+        # Process batches in parallel
+        print(f"[STEP 2/4] Processing batches in parallel...")
+        result_files = process_batches_parallel(batch_files, args, num_workers)
         
-        # Check processing mode
-        use_segmentation = getattr(args, 'enable_segmentation', False)
-        if use_segmentation:
-            segment_length = getattr(args, 'segment_length', 300)
-            segment_overlap = getattr(args, 'segment_overlap', 50)
-            print(f"[INFO] Segmentation enabled - segment_length: {segment_length}, overlap: {segment_overlap}")
-        else:
-            max_text_length = getattr(args, 'max_text_length', 350)
-            print(f"[INFO] Using traditional truncation - max_length: {max_text_length}")
+        # Combine results
+        print(f"[STEP 3/4] Combining batch results...")
+        combine_batch_results(result_files, original_df, args.output_path, args)
         
-        # Read CSV file
-        text_column = getattr(args, 'text_column', 'text')
-        original_df = prepare_csv_input(reports_path_str, text_column)
+        print(f"[STEP 4/4] Cleanup...")
         
-        # Process in batches with parallel processing
-        total_rows = len(original_df)
-        total_batches = (total_rows + batch_size - 1) // batch_size
-        print(f"[INFO] Processing {total_rows} rows in {total_batches} batches")
-        
-        all_labels = []
-        all_reports = []
-        
-        total_start_time = time.time()
-        
-        for i in range(0, total_rows, batch_size):
-            batch_num = i // batch_size + 1
-            end_idx = min(i + batch_size, total_rows)
-            batch_df = original_df.iloc[i:end_idx].copy()
-            
-            try:
-                batch_labels, batch_reports = process_batch_parallel(
-                    batch_df, text_column, batch_num, total_batches, args, num_workers
-                )
-                
-                all_labels.append(batch_labels)
-                all_reports.extend(batch_reports)
-                
-                print(f"[PROGRESS] Completed {batch_num}/{total_batches} batches ({end_idx}/{total_rows} rows)")
-                
-            except Exception as e:
-                print(f"[ERROR] Failed to process batch {batch_num}: {e}")
-                raise
-        
-        total_processing_time = time.time() - total_start_time
-        print(f"[INFO] Total processing time: {total_processing_time:.2f} seconds")
-        print(f"[INFO] Average time per record: {total_processing_time/total_rows:.4f} seconds")
-        
-        # Combine all results
-        print(f"[INFO] Combining results from {len(all_labels)} batches...")
-        combined_labels = np.vstack(all_labels)
-        print(f"[INFO] Combined labels shape: {combined_labels.shape}")
-        
-        # Write results
-        print(f"[OUTPUT] Writing results to: {args.output_path}")
-        label_prefix = getattr(args, 'label_prefix', 'CheXpert_')
-        print(f"[OUTPUT] Using label prefix: '{label_prefix}'")
-        write_enhanced(all_reports, combined_labels, args.output_path, 
-                      original_df, args.verbose, label_prefix)
-        
-        print(f"[SUCCESS] Processing completed! Results saved to: {args.output_path}")
-        
-    else:
-        # Fallback to original single-threaded processing for text files
-        print(f"[INFO] Text file input detected. Using single-threaded processing: {reports_path_str}")
-        print("[WARNING] Parallel processing only supports CSV input. Use CSV format for better performance.")
-        
-        # Use original processing logic here
-        raise NotImplementedError("Parallel processing currently only supports CSV input")
+    finally:
+        # Cleanup temporary files
+        try:
+            shutil.rmtree(temp_dir)
+            print(f"[CLEANUP] Removed temporary directory: {temp_dir}")
+        except Exception as e:
+            print(f"[WARNING] Failed to cleanup temporary directory: {e}")
+    
+    print(f"[SUCCESS] Batch parallel processing completed!")
+    print(f"[SUCCESS] Results saved to: {args.output_path}")
 
 
 if __name__ == "__main__":
@@ -483,4 +455,4 @@ if __name__ == "__main__":
     parser.parser.add_argument('--segment_overlap', type=int, default=50,
                                 help='Overlap between segments in tokens')
     
-    label_parallel(parser.parse_args())
+    label_batch_parallel(parser.parse_args())

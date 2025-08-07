@@ -14,5 +14,4 @@ reticular marking
 reticulation
 parenchymal scarring
 peribronchial thickening
-wall thickening
-scar
+

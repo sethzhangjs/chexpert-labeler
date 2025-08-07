@@ -1,4 +1,3 @@
-mass
 nodular density
 nodular densities
 nodular opacity

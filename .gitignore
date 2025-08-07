@@ -9,3 +9,4 @@ demo/**/*.csv
 demo/**/*.txt
 demo/logs
 demo/data/archive
+logs

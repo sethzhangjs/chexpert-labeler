@@ -15,6 +15,6 @@ python -u label_csv.py\
     --output_path /home/szhan81/chexpert-labeler/demo/data/output/Atelectasis_mention_sample_analysis_results.csv\
     --batch_size 10 \
     --enable_segmentation \
-    --segment_length 350 \
-    --segment_overlap 50 \
+    --segment_length 380 \
+    --segment_overlap 30 \
     --verbose
